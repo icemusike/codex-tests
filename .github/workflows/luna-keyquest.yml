@@ -1,0 +1,122 @@
+name: Luna KeyQuest - Android and browser release
+on:
+  push:
+    branches: [luna-keyquest-preview]
+    paths: ['luna-keyquest/source.part03', '.github/workflows/luna-keyquest.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    if: github.event.head_commit.message != 'Bootstrap Luna build workflow'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LUNA_RUN: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack original game source
+        run: |
+          python3 - <<'PY'
+          import base64,lzma,tarfile,io,pathlib
+          source=''.join(pathlib.Path(f'luna-keyquest/source.part{i:02}').read_text().strip() for i in range(1,4))
+          data=lzma.decompress(base64.b64decode(source,validate=True))
+          dest=pathlib.Path('/tmp/luna-build');dest.mkdir(exist_ok=True)
+          with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            archive.extractall(dest,filter='data')
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Install build-only Python dependencies
+        run: python3 -m pip install cairosvg cryptography playwright
+      - name: Publish ephemeral deployment public key
+        run: |
+          python3 - <<'PY'
+          import os,json,base64,subprocess,pathlib
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives import serialization
+          key=rsa.generate_private_key(public_exponent=65537,key_size=3072)
+          private=pathlib.Path('/tmp/luna-deploy-private.pem')
+          private.write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()));private.chmod(0o600)
+          public=key.public_key().public_bytes(serialization.Encoding.PEM,serialization.PublicFormat.SubjectPublicKeyInfo)
+          body={'message':'Publish temporary public deployment key','branch':'luna-keyquest-preview','content':base64.b64encode(public).decode()}
+          subprocess.run(['gh','api','--method','PUT',f'repos/{os.environ["GITHUB_REPOSITORY"]}/contents/luna-keyquest/deploy-public-{os.environ["LUNA_RUN"]}.pem','--input','-'],input=json.dumps(body),text=True,check=True,stdout=subprocess.DEVNULL)
+          print('Deployment public key ready. No private key or deployment credential is published.')
+          PY
+      - name: Compile self-contained browser game
+        run: python3 /tmp/luna-build/build_web.py
+      - name: Compile signed Android testing APK
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          gradle -p /tmp/luna-build/android assembleDebug --no-daemon
+          mkdir -p /tmp/luna-release
+          cp /tmp/luna-build/android/app/build/outputs/apk/debug/app-debug.apk /tmp/luna-release/Luna-KeyQuest-v1.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose /tmp/luna-release/Luna-KeyQuest-v1.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging /tmp/luna-release/Luna-KeyQuest-v1.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump permissions /tmp/luna-release/Luna-KeyQuest-v1.apk
+      - name: Package source and browser files
+        run: |
+          cp /tmp/luna-release/Luna-KeyQuest-v1.apk /tmp/luna-build/web/Luna-KeyQuest-v1.apk
+          cd /tmp/luna-build
+          zip -qr /tmp/luna-release/Luna-KeyQuest-Web.zip web
+          zip -qr /tmp/luna-release/Luna-KeyQuest-Source.zip src web android build_web.py netlify.toml README.md -x 'android/.gradle/*' 'android/app/build/*' 'android/build/*'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Luna-KeyQuest-v1
+          path: /tmp/luna-release/*
+          retention-days: 90
+      - name: Publish readable project and browser files
+        run: |
+          git pull --ff-only origin luna-keyquest-preview
+          mkdir -p luna-keyquest/project
+          rsync -a --exclude='.gradle' --exclude='build' --exclude='*.apk' /tmp/luna-build/ luna-keyquest/project/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add luna-keyquest/project
+          git commit -m 'Publish tested Luna game source and browser bundle'
+          git push origin HEAD:luna-keyquest-preview
+          gh release create "luna-keyquest-v1-${{ github.run_number }}" /tmp/luna-release/* --target luna-keyquest-preview --title 'Luna KeyQuest v1 - Android testing build' --notes 'Romanian keyboard game. Signed sideload testing APK, Android 8+. Offline bundled resources; no network, camera, microphone, or storage permissions. Not a Play Store listing. Physical-device testing is still required. Source and browser ZIPs included.'
+      - name: Deploy to the authorized Netlify project
+        run: |
+          mkdir -p /tmp/luna-publish
+          cp -a /tmp/luna-build/web/. /tmp/luna-publish/
+          printf '[build]\n  publish = "."\n' > /tmp/luna-publish/netlify.toml
+          python3 - <<'PY'
+          import os,time,json,base64,urllib.request,urllib.error,pathlib,subprocess
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          endpoint=f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/contents/luna-keyquest/deploy-{os.environ["LUNA_RUN"]}.json?ref=luna-keyquest-preview'
+          envelope=None
+          for attempt in range(300):
+            try:
+              req=urllib.request.Request(endpoint,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(req,timeout=20) as response: value=json.load(response)
+              envelope=json.loads(base64.b64decode(value['content']));break
+            except urllib.error.HTTPError as error:
+              if error.code!=404: raise
+              time.sleep(2)
+          if envelope is None: raise RuntimeError('No encrypted deployment authorization was supplied. Android artifact and browser bundle remain available.')
+          private_path=pathlib.Path('/tmp/luna-deploy-private.pem')
+          private=serialization.load_pem_private_key(private_path.read_bytes(),password=None)
+          secret_key=private.decrypt(base64.b64decode(envelope['key']),padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          proxy=AESGCM(secret_key).decrypt(base64.b64decode(envelope['nonce']),base64.b64decode(envelope['data']),None).decode()
+          if not proxy.startswith('https://netlify-mcp.netlify.app/proxy/'): raise ValueError('Unexpected deployment proxy')
+          print('::add-mask::'+proxy,flush=True)
+          result=subprocess.run(['npx','-y','@netlify/mcp@latest','--site-id','78a46c76-2ca9-4f68-8ebf-851a9d36ea18','--proxy-path',proxy],cwd='/tmp/luna-publish',capture_output=True,text=True,timeout=600)
+          print(result.stdout.replace(proxy,'[REDACTED]'));print(result.stderr.replace(proxy,'[REDACTED]'))
+          private_path.unlink(missing_ok=True)
+          if result.returncode: raise RuntimeError('Netlify deployment command failed')
+          PY
+      - name: Confirm live browser preview
+        run: |
+          curl --fail --retry 8 --retry-delay 5 https://luna-keyquest.netlify.app/ -o /tmp/live-luna.html
+          grep -q 'LunaApp' /tmp/live-luna.html
+          curl --fail --head https://luna-keyquest.netlify.app/Luna-KeyQuest-v1.apk
+          echo 'LIVE PREVIEW: https://luna-keyquest.netlify.app/'
