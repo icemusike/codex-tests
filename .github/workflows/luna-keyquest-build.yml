@@ -22,6 +22,7 @@ jobs:
       - name: Materialize the reviewed source and app resources
         run: |
           python -m pip install --quiet cairosvg
+          python -c "from pathlib import Path; import json; p=Path('luna-keyquest/game.bundle'); b=json.loads(p.read_text()); b['gzip_base64']=''.join((p.parent / f).read_text().strip() for f in b.pop('parts')); p.write_text(json.dumps(b))"
           python luna-keyquest/build-project.py
       - name: Install Android build tools
         run: |
@@ -48,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           cd luna-dist
-          zip -q -r Luna-KeyQuest-Source.zip web android -x 'android/build/*'
+          zip -q -r Luna-KeyQuest-Source.zip web android README.txt -x 'android/build/*' 'web/.git/*'
           TAG="luna-review-${GITHUB_RUN_NUMBER}"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Luna KeyQuest review build ${GITHUB_RUN_NUMBER}" --notes "Review build for family testing. Includes an offline Android APK and full HTML/Java source. No account, ads, analytics, or Android network permission. This is a sideloaded review APK, not a Play Store release. A fresh test signing key is used on each build, so a later review APK may require uninstalling the previous build, which removes its local progress. Android 8+ with an up-to-date Android System WebView is required. The APK signature is checked during the build; physical-device testing is still needed."
           gh release upload "$TAG" android/build/Luna-KeyQuest.apk Luna-KeyQuest-Source.zip --repo "$GITHUB_REPOSITORY" --clobber
