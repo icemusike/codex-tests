@@ -1,0 +1,37 @@
+name: Verify Luna KeyQuest public preview
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/luna-keyquest-preview-check.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check public review HTML and supporting assets
+        shell: python
+        run: |
+          import urllib.request, time, hashlib
+          base = 'https://raw.githack.com/icemusike/codex-tests/luna-keyquest-review/'
+          for path in ['index.html', 'manifest.webmanifest', 'icon-192.png']:
+              for attempt in range(3):
+                  try:
+                      request = urllib.request.Request(base + path, headers={'User-Agent': 'Luna-KeyQuest-Release-Check/1.0'})
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          body = response.read()
+                          kind = response.headers.get('Content-Type', '')
+                          assert response.status == 200
+                          if path == 'index.html':
+                              assert 'text/html' in kind, kind
+                              assert b'<title>Luna KeyQuest' in body and b'lunaStatus' in body
+                              assert len(body) > 50000
+                          print(path, 'HTTP 200', kind, len(body), 'bytes', 'SHA256', hashlib.sha256(body).hexdigest())
+                      break
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(10)
+          print('PUBLIC PREVIEW PASSED:', base + 'index.html')
