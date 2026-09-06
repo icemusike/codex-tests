@@ -26,7 +26,7 @@ jobs:
           with tarfile.open(fileobj=io.BytesIO(data)) as archive:
             archive.extractall(dest,filter='data')
           PY
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -51,6 +51,11 @@ jobs:
           PY
       - name: Compile self-contained browser game
         run: python3 /tmp/luna-build/build_web.py
+      - name: Test browser input, local progress and offline play
+        run: |
+          python3 -m playwright install --with-deps chromium
+          python3 luna-keyquest/browser-ci.py
+      - uses: android-actions/setup-android@v3
       - name: Compile signed Android testing APK
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
@@ -66,6 +71,8 @@ jobs:
           cd /tmp/luna-build
           zip -qr /tmp/luna-release/Luna-KeyQuest-Web.zip web
           zip -qr /tmp/luna-release/Luna-KeyQuest-Source.zip src web android build_web.py netlify.toml README.md -x 'android/.gradle/*' 'android/app/build/*' 'android/build/*'
+          cd /tmp/luna-release
+          zip -qr Luna-KeyQuest-Browser-Tests.zip browser-tests
       - uses: actions/upload-artifact@v4
         with:
           name: Luna-KeyQuest-v1
@@ -81,7 +88,7 @@ jobs:
           git add luna-keyquest/project
           git commit -m 'Publish tested Luna game source and browser bundle'
           git push origin HEAD:luna-keyquest-preview
-          gh release create "luna-keyquest-v1-${{ github.run_number }}" /tmp/luna-release/* --target luna-keyquest-preview --title 'Luna KeyQuest v1 - Android testing build' --notes 'Romanian keyboard game. Signed sideload testing APK, Android 8+. Offline bundled resources; no network, camera, microphone, or storage permissions. Not a Play Store listing. Physical-device testing is still required. Source and browser ZIPs included.'
+          gh release create "luna-keyquest-v1-${{ github.run_number }}" /tmp/luna-release/*.zip /tmp/luna-release/*.apk --target luna-keyquest-preview --title 'Luna KeyQuest v1 - Android testing build' --notes 'Romanian keyboard game. Signed sideload testing APK, Android 8+. Offline bundled resources; no network, camera, microphone, or storage permissions. Not a Play Store listing. Physical-device testing is still required. Source, browser ZIPs, and automated browser test results included.'
       - name: Deploy to the authorized Netlify project
         run: |
           mkdir -p /tmp/luna-publish
