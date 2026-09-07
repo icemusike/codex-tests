@@ -11,31 +11,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Retrieve exact previously delivered APK and test sources
+      - name: Retrieve exact previously delivered APK
         run: |
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           mkdir -p inputs evidence
           python3 - <<'PY'
           import urllib.request,json,pathlib,zipfile,hashlib
-          base='https://api.firestorage.ai/dev/file/shares/'
-          for share,name in [('nEqMjl6m75mN','old.apk'),('8BcwXo2CSnI1','old-bundle.zip')]:
-              root=base+share
-              listing=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))
-              file=listing['files'][0]
-              meta=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+file['fileId']+'/download',method='POST'),timeout=40))
-              data=urllib.request.urlopen(meta['downloadUrl'],timeout=60).read()
-              pathlib.Path('inputs/'+name).write_bytes(data)
-              assert zipfile.is_zipfile('inputs/'+name)
-              print(name,len(data),hashlib.sha256(data).hexdigest())
+          root='https://api.firestorage.ai/dev/file/shares/nEqMjl6m75mN'
+          file=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))['files'][0]
+          meta=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+file['fileId']+'/download',method='POST'),timeout=40))
+          data=urllib.request.urlopen(meta['downloadUrl'],timeout=60).read()
+          pathlib.Path('inputs/old.apk').write_bytes(data)
+          assert zipfile.is_zipfile('inputs/old.apk')
+          print(len(data),hashlib.sha256(data).hexdigest())
           PY
       - name: Prepare Android 16 emulator
         run: |
           sudo chmod 666 /dev/kvm
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-36;google_apis;x86_64' >/dev/null
-          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomcrash -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomcrash -p "$ANDROID_AVD_HOME/bloomcrash.avd" -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-36\n' "$ANDROID_AVD_HOME/bloomcrash.avd" > "$ANDROID_AVD_HOME/bloomcrash.ini"
+          "$ANDROID_HOME/emulator/emulator" -list-avds
           nohup "$ANDROID_HOME/emulator/emulator" -avd bloomcrash -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
-          timeout 90 adb wait-for-device
-          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          timeout 120 adb wait-for-device || { cat evidence/emulator.log; exit 1; }
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done' || { cat evidence/emulator.log; exit 1; }
           adb shell input keyevent 82
           adb shell getprop ro.build.version.sdk | tee evidence/api.txt
       - name: Reproduce original startup failure
