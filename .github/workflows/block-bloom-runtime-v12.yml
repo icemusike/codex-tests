@@ -1,0 +1,114 @@
+name: Block Bloom 1.2 Android 16 runtime validation
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-runtime-v12.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Retrieve exact signed candidate and verify checksum
+        run: |
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          mkdir -p evidence
+          python3 - <<'PY'
+          import urllib.request,json,pathlib,zipfile,hashlib
+          root='https://api.firestorage.ai/dev/file/shares/-Aewt_A0xCZy'
+          f=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))['files'][0]
+          m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST'),timeout=40))
+          data=urllib.request.urlopen(m['downloadUrl'],timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='289e9076aa71a44031635f9ec7b2caca3c6a0ba1fdc580bc007297dd3793d5a0'
+          pathlib.Path('candidate.zip').write_bytes(data)
+          with zipfile.ZipFile('candidate.zip') as z:z.extractall('candidate')
+          for name,sha in json.loads(pathlib.Path('candidate/checksums.json').read_text()).items():
+              assert hashlib.sha256(pathlib.Path('candidate',name).read_bytes()).hexdigest()==sha
+          print('Candidate bytes match the local build')
+          PY
+      - name: Boot Android 16 tablet emulator
+        run: |
+          sudo chmod 666 /dev/kvm
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomtest -p "$ANDROID_AVD_HOME/bloomtest.avd" -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-36\n' "$ANDROID_AVD_HOME/bloomtest.avd" > "$ANDROID_AVD_HOME/bloomtest.ini"
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloomtest -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
+          timeout 120 adb wait-for-device || { cat evidence/emulator.log; exit 1; }
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done' || { cat evidence/emulator.log; exit 1; }
+          adb shell input keyevent 82
+          adb shell wm size 1280x800
+          adb shell wm density 160
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell getprop ro.build.version.sdk | tee evidence/api.txt
+          sleep 5
+      - name: Signature, installation and three independent cold launches
+        run: |
+          set -euo pipefail
+          APK=candidate/Block-Bloom-1.2-Android16.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK" > evidence/signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 "$APK" > evidence/alignment.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" > evidence/manifest.txt
+          adb install "$APK" | tee evidence/install.txt
+          grep -q '^Success' evidence/install.txt
+          for i in 1 2 3; do
+            adb shell am force-stop com.adrianisfan.blockbloom.android16
+            adb logcat -c
+            adb shell am start -W -n com.adrianisfan.blockbloom.android16/.MainActivity > "evidence/launch-$i.txt"
+            for j in $(seq 1 20); do
+              adb logcat -d > "evidence/cold-$i-logcat.txt"
+              if grep -q 'BLOOM_READY version=1.2' "evidence/cold-$i-logcat.txt"; then break; fi
+              sleep 1
+            done
+            grep -q 'BLOOM_READY version=1.2' "evidence/cold-$i-logcat.txt"
+            adb shell pidof com.adrianisfan.blockbloom.android16
+            echo "PASS cold launch $i" | tee -a evidence/cold-launches.txt
+          done
+          adb exec-out screencap -p > evidence/home.png
+      - name: Touch gameplay, line clears, scoring, Undo and Pause Resume
+        run: |
+          set -euo pipefail
+          adb install candidate/Block-Bloom-Runtime-Tests.apk
+          adb shell am force-stop com.adrianisfan.blockbloom.android16
+          adb shell am instrument -w -r -e phase first com.adrianisfan.blockbloom.test/.SmokeInstrumentation | tee evidence/test-first.txt
+          grep -q 'BLOCK_BLOOM_RUNTIME_TESTS_PASSED' evidence/test-first.txt
+      - name: Process restart, saved score and adaptive portrait layout
+        run: |
+          set -euo pipefail
+          adb shell am force-stop com.adrianisfan.blockbloom.android16
+          adb shell wm size 800x1280
+          sleep 3
+          adb shell am instrument -w -r -e phase resume com.adrianisfan.blockbloom.test/.SmokeInstrumentation | tee evidence/test-restart.txt
+          grep -q 'BLOCK_BLOOM_RUNTIME_TESTS_PASSED' evidence/test-restart.txt
+          adb shell am start -W -n com.adrianisfan.blockbloom.android16/.MainActivity
+          sleep 3
+          adb exec-out screencap -p > evidence/portrait.png
+          adb install -r candidate/Block-Bloom-1.2-Android16.apk | tee evidence/update.txt
+          grep -q '^Success' evidence/update.txt
+      - name: Save runtime logs and screenshots
+        if: always()
+        run: |
+          adb logcat -d -b crash > evidence/crash.txt || true
+          adb logcat -d > evidence/logcat.txt || true
+          adb exec-out screencap -p > evidence/final-screen.png || true
+      - name: Publish only after all runtime checks pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ! grep -q 'Process: com.adrianisfan.blockbloom.android16' evidence/crash.txt
+          TAG='block-bloom-v1.2'
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title 'Block Bloom 1.2 - startup crash fix' --notes 'Fixes the reproduced Android 16 startup NullPointerException caused by querying the window insets controller before the decor window existed. Runtime-tested on an Android 16 x86_64 Pixel Tablet emulator: install, three cold launches, rendered canvas, touch placement, line clearing and scoring, Undo, Pause/Resume, 200 simulated legal moves, 24 level initializations, saved progress after force-stop/restart, landscape and portrait, and same-version reinstall. No physical Lenovo tablet test has been performed. Uninstall version 1.1 first because the signing key was replaced. Offline app with no ads, accounts, analytics or network permission.'
+          gh release upload "$TAG" candidate/Block-Bloom-1.2-Android16.apk --repo "$GITHUB_REPOSITORY" --clobber
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Block-Bloom-1.2-Runtime-Evidence
+          path: evidence/
+          retention-days: 30
