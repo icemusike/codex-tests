@@ -1,0 +1,66 @@
+name: Block Bloom startup crash reproduction
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-crash-repro.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Retrieve exact previously delivered APK and test sources
+        run: |
+          mkdir -p inputs evidence
+          python3 - <<'PY'
+          import urllib.request,json,pathlib,zipfile,hashlib
+          base='https://api.firestorage.ai/dev/file/shares/'
+          for share,name in [('nEqMjl6m75mN','old.apk'),('8BcwXo2CSnI1','old-bundle.zip')]:
+              try:
+                  root=base+share
+                  listing=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))
+                  file=listing['files'][0]
+                  meta=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+file['fileId']+'/download',method='POST'),timeout=40))
+                  data=urllib.request.urlopen(meta['downloadUrl'],timeout=60).read()
+                  pathlib.Path('inputs/'+name).write_bytes(data)
+                  assert zipfile.is_zipfile('inputs/'+name)
+                  print(name,len(data),hashlib.sha256(data).hexdigest())
+              except Exception as e:
+                  print(name,type(e).__name__,str(e))
+                  if name=='old.apk':raise
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Crash-Inputs
+          path: inputs/
+          retention-days: 7
+      - name: Prepare Android 16 emulator
+        run: |
+          sudo chmod 666 /dev/kvm
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomcrash -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloomcrash -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
+          adb wait-for-device
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell input keyevent 82
+          adb shell getprop ro.build.version.sdk | tee evidence/api.txt
+      - name: Reproduce original startup failure
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging inputs/old.apk > evidence/manifest.txt
+          adb install inputs/old.apk | tee evidence/install.txt
+          adb logcat -c
+          adb shell am start -W -n com.adrianisfan.blockbloom.android16/.MainActivity | tee evidence/start.txt
+          sleep 20
+          adb logcat -d -b crash > evidence/crash.txt
+          adb logcat -d > evidence/logcat.txt
+          adb shell pidof com.adrianisfan.blockbloom.android16 > evidence/pid.txt || true
+          adb exec-out screencap -p > evidence/old-screen.png
+          cat evidence/crash.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Block-Bloom-Crash-Reproduction
+          path: evidence/
+          retention-days: 14
