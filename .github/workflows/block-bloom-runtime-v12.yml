@@ -17,11 +17,11 @@ jobs:
           mkdir -p evidence
           python3 - <<'PY'
           import urllib.request,json,pathlib,zipfile,hashlib
-          root='https://api.firestorage.ai/dev/file/shares/-Aewt_A0xCZy'
+          root='https://api.firestorage.ai/dev/file/shares/Os5nfj-ErtSa'
           f=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))['files'][0]
           m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST'),timeout=40))
           data=urllib.request.urlopen(m['downloadUrl'],timeout=60).read()
-          assert hashlib.sha256(data).hexdigest()=='289e9076aa71a44031635f9ec7b2caca3c6a0ba1fdc580bc007297dd3793d5a0'
+          assert hashlib.sha256(data).hexdigest()=='1edc11083686533f23cbdd1277af1a02019c655619284a257d715573e33369e5'
           pathlib.Path('candidate.zip').write_bytes(data)
           with zipfile.ZipFile('candidate.zip') as z:z.extractall('candidate')
           for name,sha in json.loads(pathlib.Path('candidate/checksums.json').read_text()).items():
@@ -70,6 +70,7 @@ jobs:
             adb shell pidof com.adrianisfan.blockbloom.android16
             echo "PASS cold launch $i" | tee -a evidence/cold-launches.txt
           done
+          sleep 6
           adb exec-out screencap -p > evidence/home.png
       - name: Touch gameplay, line clears, scoring, Undo and Pause Resume
         run: |
@@ -87,7 +88,7 @@ jobs:
           adb shell am instrument -w -r -e phase resume com.adrianisfan.blockbloom.test/.SmokeInstrumentation | tee evidence/test-restart.txt
           grep -q 'BLOCK_BLOOM_RUNTIME_TESTS_PASSED' evidence/test-restart.txt
           adb shell am start -W -n com.adrianisfan.blockbloom.android16/.MainActivity
-          sleep 3
+          sleep 10
           adb exec-out screencap -p > evidence/portrait.png
           adb install -r candidate/Block-Bloom-1.2-Android16.apk | tee evidence/update.txt
           grep -q '^Success' evidence/update.txt
