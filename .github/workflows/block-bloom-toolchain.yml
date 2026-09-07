@@ -1,0 +1,45 @@
+name: Block Bloom Android 16 toolchain
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-toolchain.yml']
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtain official Android SDK 36 tools
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          mkdir -p repair-tools/lib repair-tools/lib64 diagnostics
+          cp "$ANDROID_HOME/platforms/android-36/android.jar" repair-tools/
+          for tool in aapt aapt2 zipalign dexdump core-lambda-stubs.jar; do cp "$ANDROID_HOME/build-tools/36.0.0/$tool" repair-tools/; done
+          cp "$ANDROID_HOME/build-tools/36.0.0/lib/d8.jar" "$ANDROID_HOME/build-tools/36.0.0/lib/apksigner.jar" repair-tools/lib/
+          cp "$ANDROID_HOME/build-tools/36.0.0/lib64/libc++.so" repair-tools/lib64/
+          sha256sum repair-tools/*jar repair-tools/lib/*jar > diagnostics/tool-checksums.txt
+      - name: Inspect the previously shared APK download page
+        run: |
+          python3 - <<'PY'
+          import urllib.request, pathlib, re
+          url = 'https://firestorage.ai/ja/f/9EVXAuwk-3l8'
+          try:
+              r = urllib.request.urlopen(url, timeout=40)
+              page = r.read().decode('utf-8', 'replace')
+              pathlib.Path('diagnostics/share.html').write_text(page)
+              print('Share HTTP status:', r.status, 'length:', len(page))
+              for match in re.finditer(r'.{0,200}(?:download|public_id|file_id|gEr5WBgu|\.apk|src=).{0,300}', page):
+                  print(match.group(0))
+          except Exception as e:
+              print('Share inspection:', str(e))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Android36-Tools
+          path: |
+            repair-tools/
+            diagnostics/
+          retention-days: 3
