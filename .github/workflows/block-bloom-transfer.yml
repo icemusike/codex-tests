@@ -1,0 +1,32 @@
+name: Block Bloom download diagnostics
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect public download client
+        run: |
+          mkdir -p diagnostics
+          python3 - <<'PY'
+          import urllib.request, re, pathlib
+          base = 'https://firestorage.ai'
+          page = urllib.request.urlopen(base + '/ja/f/9EVXAuwk-3l8',timeout=30).read().decode()
+          for index, path in enumerate(re.findall(r'<script[^>]+src="([^"]+)"',page)):
+              if '/app/' not in path and not any(x in path for x in ['8437-','5841-','4899-']): continue
+              data=urllib.request.urlopen(base+path,timeout=30).read().decode()
+              pathlib.Path(f'diagnostics/client-{index}.js').write_text(data)
+              print('SCRIPT:',path)
+              matches=list(re.finditer(r'.{0,120}(?:/api/|download|share_token|shareToken|file_id|public_id).{0,200}',data))
+              for match in matches[:40]:print(match.group(0))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Transfer-Diagnostics
+          path: diagnostics/
+          retention-days: 1
