@@ -1,0 +1,126 @@
+name: Block Bloom Luna-method APK
+on:
+  push:
+    branches: [block-bloom-luna-method]
+    paths: ['.github/workflows/block-bloom-luna-method.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Block Bloom game asset
+        run: |
+          python3 - <<'PY'
+          import urllib.request,json,pathlib,zipfile,hashlib
+          root='https://api.firestorage.ai/dev/file/shares/eYUxQQYd7xmd'
+          f=json.load(urllib.request.urlopen(root+'/files?maxResults=1000'))['files'][0]
+          m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST')))
+          data=urllib.request.urlopen(m['downloadUrl']).read()
+          assert hashlib.sha256(data).hexdigest()=='d9a748f58b7702d582888eb92d73815d82e62d463e7bd6b0e4af4cc3096138c3'
+          pathlib.Path('input.zip').write_bytes(data)
+          zipfile.ZipFile('input.zip').extractall('input')
+          PY
+      - name: Materialize Luna-style Android wrapper
+        run: |
+          mkdir -p bloom/android/src/ro/blockbloom/game bloom/android/res/drawable bloom/android/res/values bloom/android/assets
+          cp input/index.html bloom/android/assets/index.html
+          cp input/icon.png bloom/android/res/drawable/icon.png
+          cat > bloom/android/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="ro.blockbloom.game" android:versionCode="1" android:versionName="1.0-luna-method">
+            <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"/>
+            <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+            <application android:label="Block Bloom Luna" android:icon="@drawable/icon" android:theme="@style/AppTheme" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true" android:enableOnBackInvokedCallback="true">
+              <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden|keyboard" android:resizeableActivity="true">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > bloom/android/res/values/styles.xml <<'EOF'
+          <resources><style name="AppTheme" parent="android:style/Theme.Material.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:windowActionModeOverlay">true</item><item name="android:windowLightStatusBar">false</item><item name="android:statusBarColor">#17223d</item><item name="android:navigationBarColor">#17223d</item><item name="android:windowBackground">#17223d</item><item name="android:colorAccent">#ffb077</item></style></resources>
+          EOF
+          cat > bloom/android/src/ro/blockbloom/game/MainActivity.java <<'EOF'
+          package ro.blockbloom.game;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.os.Build;
+          import android.graphics.Color;
+          import android.view.WindowManager;
+          import android.webkit.WebView;
+          import android.webkit.WebSettings;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.widget.Toast;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.nio.charset.StandardCharsets;
+          public final class MainActivity extends Activity {
+            private WebView web;
+            @Override public void onCreate(Bundle state) {
+              super.onCreate(state);
+              getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              getWindow().setStatusBarColor(Color.rgb(23,34,61));
+              getWindow().setNavigationBarColor(Color.rgb(23,34,61));
+              web = new WebView(this);
+              web.setBackgroundColor(Color.rgb(23,34,61));
+              WebSettings s=web.getSettings();
+              s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true);
+              s.setAllowFileAccess(false); s.setAllowContentAccess(false); s.setBlockNetworkLoads(true);
+              s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW); s.setMediaPlaybackRequiresUserGesture(true);
+              s.setBuiltInZoomControls(false); s.setSupportZoom(false); s.setSafeBrowsingEnabled(true);
+              web.setWebViewClient(new WebViewClient(){@Override public boolean shouldOverrideUrlLoading(WebView v,WebResourceRequest r){return true;}});
+              web.setWebChromeClient(new WebChromeClient());
+              setContentView(web);
+              if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(0,this::handleBack);
+              try(InputStream in=getAssets().open("index.html")){
+                ByteArrayOutputStream b=new ByteArrayOutputStream(); byte[] d=new byte[8192]; int n;
+                while((n=in.read(d))!=-1)b.write(d,0,n);
+                String html=new String(b.toByteArray(),StandardCharsets.UTF_8);
+                web.loadDataWithBaseURL("https://appassets.androidplatform.net/",html,"text/html","UTF-8",null);
+              }catch(Exception ex){Toast.makeText(this,"Block Bloom could not open. Reinstall the app.",Toast.LENGTH_LONG).show();finish();}
+            }
+            private void handleBack(){if(web==null){finish();return;}web.evaluateJavascript("Boolean(window.nativeBack&&window.nativeBack())",h->{if(!"true".equals(h))finish();});}
+            @Override public void onBackPressed(){handleBack();}
+            @Override protected void onPause(){if(web!=null){web.evaluateJavascript("window.nativePause&&window.nativePause()",null);web.onPause();}super.onPause();}
+            @Override protected void onResume(){super.onResume();if(web!=null)web.onResume();}
+            @Override protected void onDestroy(){if(web!=null){web.destroy();web=null;}super.onDestroy();}
+          }
+          EOF
+      - name: Install same Android SDK used by Luna
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+      - name: Build with Luna aapt d8 zipalign apksigner sequence
+        working-directory: bloom/android
+        run: |
+          set -euo pipefail
+          TOOLS="$ANDROID_HOME/build-tools/35.0.0"; PLATFORM="$ANDROID_HOME/platforms/android-35/android.jar"
+          mkdir -p build/classes build/dex
+          javac -encoding UTF-8 -source 8 -target 8 -classpath "$PLATFORM" -d build/classes src/ro/blockbloom/game/MainActivity.java
+          jar cf build/classes.jar -C build/classes .
+          "$TOOLS/d8" --lib "$PLATFORM" --min-api 26 --output build/dex build/classes.jar
+          "$TOOLS/aapt" package -f -M AndroidManifest.xml -S res -A assets -I "$PLATFORM" -F build/unsigned.apk
+          (cd build/dex && zip -q ../unsigned.apk classes.dex)
+          "$TOOLS/zipalign" -f -p 4 build/unsigned.apk build/aligned.apk
+          keytool -genkeypair -keystore build/review-signing.jks -storepass android -keypass android -alias bloom-luna -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Block Bloom Luna Review,O=Family Review,C=RO" >/dev/null 2>&1
+          "$TOOLS/apksigner" sign --ks build/review-signing.jks --ks-pass pass:android --key-pass pass:android --out build/Block-Bloom-Luna-Method.apk build/aligned.apk
+          "$TOOLS/apksigner" verify --verbose build/Block-Bloom-Luna-Method.apk | tee build/signature.txt
+          "$TOOLS/zipalign" -c -v 4 build/Block-Bloom-Luna-Method.apk | tee build/alignment.txt
+          "$TOOLS/aapt" dump badging build/Block-Bloom-Luna-Method.apk | tee build/badging.txt
+      - name: Publish APK
+        run: |
+          TAG="block-bloom-luna-method-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Block Bloom Luna-method build ${GITHUB_RUN_NUMBER}" --notes "Block Bloom rebuilt using the same Android packaging recipe as the working Luna KeyQuest review APK: API 35, plain Activity+WebView, aapt+d8+4-byte zipalign+apksigner, no Gradle, no permissions, fresh package ro.blockbloom.game."
+          gh release upload "$TAG" bloom/android/build/Block-Bloom-Luna-Method.apk bloom/android/build/signature.txt bloom/android/build/alignment.txt bloom/android/build/badging.txt --repo "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Luna-Method
+          path: bloom/android/build/Block-Bloom-Luna-Method.apk
+          retention-days: 30
