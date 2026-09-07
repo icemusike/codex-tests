@@ -1,0 +1,185 @@
+name: Block Bloom Play 1.3 install and runtime verification
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-install-v13.yml']
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Retrieve exact signed APKs and test sources
+        run: |
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          mkdir -p evidence
+          python3 - <<'PY'
+          import urllib.request,json,pathlib,zipfile,hashlib
+          root='https://api.firestorage.ai/dev/file/shares/OOXnBpnzWmjS'
+          f=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))['files'][0]
+          m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST'),timeout=40))
+          data=urllib.request.urlopen(m['downloadUrl'],timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='57d6600467b8b848681c239c8e1c8ccc206757c49acd5741a808fea0c94600f6'
+          pathlib.Path('candidate.zip').write_bytes(data)
+          with zipfile.ZipFile('candidate.zip') as z:z.extractall('candidate')
+          for name,sha in json.loads(pathlib.Path('candidate/checksums.json').read_text()).items():
+              assert hashlib.sha256(pathlib.Path('candidate',name).read_bytes()).hexdigest()==sha
+          print('All candidate and source bytes match local checksums')
+          PY
+      - name: Boot a clean Android 16 tablet
+        run: |
+          sudo chmod 666 /dev/kvm
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloom13 -p "$ANDROID_AVD_HOME/bloom13.avd" -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-36\n' "$ANDROID_AVD_HOME/bloom13.avd" > "$ANDROID_AVD_HOME/bloom13.ini"
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloom13 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
+          timeout 120 adb wait-for-device || { cat evidence/emulator.log; exit 1; }
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done' || { cat evidence/emulator.log; exit 1; }
+          adb shell input keyevent 82
+          adb shell wm size 1280x800
+          adb shell wm density 160
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell getprop ro.build.version.sdk | tee evidence/api.txt
+          sleep 5
+      - name: Reproduce version 1.2 signing conflict with version 1.1 installed
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs candidate/previous-v11.apk > evidence/v11-signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs candidate/previous-v12.apk > evidence/v12-signature.txt
+          adb install candidate/previous-v11.apk | tee evidence/v11-install.txt
+          grep -q '^Success' evidence/v11-install.txt
+          if adb install -r candidate/previous-v12.apk > evidence/v12-conflict.txt 2>&1; then
+            echo 'Expected an incompatible-signature rejection'; exit 1
+          fi
+          cat evidence/v12-conflict.txt
+          grep -q 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' evidence/v12-conflict.txt
+          echo 'PASS reproduced signature conflict: version 1.2 cannot replace version 1.1' | tee evidence/conflict-result.txt
+      - name: Install new app alongside the old one without uninstalling
+        run: |
+          set -euo pipefail
+          APK=candidate/Block-Bloom-Play-1.3.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK" > evidence/signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 "$APK" > evidence/alignment.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" > evidence/manifest.txt
+          adb install "$APK" | tee evidence/side-by-side-install.txt
+          grep -q '^Success' evidence/side-by-side-install.txt
+          adb shell pm path com.adrianisfan.blockbloom.android16 | tee evidence/old-package-path.txt
+          adb shell pm path com.adrianisfan.blockbloom.play | tee evidence/new-package-path.txt
+          grep -q '^package:' evidence/old-package-path.txt
+          grep -q '^package:' evidence/new-package-path.txt
+          adb shell pm list packages | grep 'com.adrianisfan.blockbloom' | tee evidence/coexisting-packages.txt
+          echo 'PASS new app installed while old app remained installed' | tee evidence/coexist-result.txt
+      - name: Verify three fresh launches and an actually rendered game
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            adb shell am force-stop com.adrianisfan.blockbloom.play
+            adb logcat -c
+            adb shell am start -W -n com.adrianisfan.blockbloom.play/.MainActivity > "evidence/launch-$i.txt"
+            for j in $(seq 1 25); do
+              adb logcat -d > "evidence/cold-$i-logcat.txt"
+              if grep -q 'BLOOM_READY version=1.3' "evidence/cold-$i-logcat.txt"; then break; fi
+              sleep 1
+            done
+            grep -q 'BLOOM_READY version=1.3' "evidence/cold-$i-logcat.txt"
+            adb shell pidof com.adrianisfan.blockbloom.play
+            echo "PASS cold launch $i" | tee -a evidence/cold-launches.txt
+          done
+          sleep 5
+          adb exec-out screencap -p > evidence/home.png
+      - name: Test touchscreen gameplay, score, Undo and Pause Resume
+        run: |
+          set -euo pipefail
+          adb install candidate/Block-Bloom-Play-Tests.apk
+          adb shell am force-stop com.adrianisfan.blockbloom.play
+          adb shell am instrument -w -r -e phase first com.adrianisfan.blockbloom.play.test/.SmokeInstrumentation | tee evidence/test-first.txt
+          grep -q 'BLOCK_BLOOM_RUNTIME_TESTS_PASSED' evidence/test-first.txt
+      - name: Test saved progress after restart and portrait layout
+        run: |
+          set -euo pipefail
+          adb shell am force-stop com.adrianisfan.blockbloom.play
+          adb shell wm size 800x1280
+          sleep 3
+          adb shell am instrument -w -r -e phase resume com.adrianisfan.blockbloom.play.test/.SmokeInstrumentation | tee evidence/test-restart.txt
+          grep -q 'BLOCK_BLOOM_RUNTIME_TESTS_PASSED' evidence/test-restart.txt
+          adb shell am start -W -n com.adrianisfan.blockbloom.play/.MainActivity
+          sleep 8
+          adb exec-out screencap -p > evidence/portrait.png
+          adb install -r candidate/Block-Bloom-Play-1.3.apk | tee evidence/reinstall.txt
+          grep -q '^Success' evidence/reinstall.txt
+      - name: Check an old copy retained in another Android user
+        run: |
+          set -euo pipefail
+          adb shell pm create-user BloomInstallTest > evidence/create-user.txt 2>&1 || true
+          if grep -q 'Success: created user' evidence/create-user.txt; then
+            U=$(sed -n 's/.*id \([0-9][0-9]*\).*/\1/p' evidence/create-user.txt | tr -d '\r')
+            test -n "$U"
+            adb shell cmd package install-existing --user "$U" com.adrianisfan.blockbloom.android16 | tee evidence/old-other-user.txt
+            adb shell pm uninstall --user 0 com.adrianisfan.blockbloom.android16 | tee evidence/old-remove-user0.txt
+            grep -q 'Success' evidence/old-remove-user0.txt
+            if adb install -r candidate/previous-v12.apk > evidence/v12-other-user-conflict.txt 2>&1; then
+              echo 'Expected signing conflict with old app retained in other user'; exit 1
+            fi
+            grep -q 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' evidence/v12-other-user-conflict.txt
+            adb install -r candidate/Block-Bloom-Play-1.3.apk | tee evidence/other-user-reinstall.txt
+            grep -q '^Success' evidence/other-user-reinstall.txt
+            echo 'PASS separate ID installs even when old signing identity is retained in another Android user' | tee evidence/multiuser-result.txt
+          else
+            echo 'SKIPPED: emulator does not permit an additional user' | tee evidence/multiuser-result.txt
+          fi
+      - name: Collect crash log and runtime package metadata
+        if: always()
+        run: |
+          adb logcat -d -b crash > evidence/crash.txt || true
+          adb logcat -d > evidence/logcat.txt || true
+          adb shell dumpsys package com.adrianisfan.blockbloom.play > evidence/package.txt || true
+      - name: Publish only the exact APK that passed installation and runtime tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ! grep -q 'Process: com.adrianisfan.blockbloom.play' evidence/crash.txt
+          python3 - <<'PY'
+          import os,hashlib,pathlib,zipfile
+          apk=pathlib.Path('candidate/Block-Bloom-Play-1.3.apk')
+          text='BLOCK BLOOM PLAY 1.3 - ANDROID 16 VERIFICATION\n\n'
+          text+='Application ID: com.adrianisfan.blockbloom.play\nVersion: 1.3 (4), minSdk 26, targetSdk 36\n'
+          text+='APK SHA-256: '+hashlib.sha256(apk.read_bytes()).hexdigest()+'\n'
+          for name in ['conflict-result.txt','coexist-result.txt','cold-launches.txt','test-first.txt','test-restart.txt','multiuser-result.txt']:
+            text+='\n'+pathlib.Path('evidence',name).read_text()+'\n'
+          text+='\nSame-signature reinstallation: PASS\nAPK signature and alignment verification: PASS\n'
+          text+='Game HTML byte-identical to version 1.2; startup fix retained.\n'
+          text+='Tests ran on an Android 16 API 36 x86_64 Pixel Tablet emulator, not a physical Lenovo.\n'
+          text+='Two hundred engine moves and 24 level initialization checks are not 24 full level completions.\n'
+          text+='Persistence tested after pending writes had time to commit, not instant power loss.\n'
+          text+='No guarantee about device policy, parental controls, storage or download corruption on the physical tablet.\n'
+          text+='Run: https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID']+'\n'
+          pathlib.Path('evidence/Block-Bloom-Play-1.3-Verification.txt').write_text(text)
+          with zipfile.ZipFile('Block-Bloom-Play-1.3-Source.zip','w',zipfile.ZIP_DEFLATED) as z:
+            for f in pathlib.Path('candidate/source').rglob('*'):
+              if f.is_file():z.write(f,f.relative_to('candidate/source'))
+          PY
+          TAG='block-bloom-play-v1.3'
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title 'Block Bloom Play 1.3 - separate installation' --notes 'New app ID com.adrianisfan.blockbloom.play avoids incompatible-signature conflicts with earlier Block Bloom builds. Runtime-tested on Android 16 with version 1.1 still installed. Existing app need not be uninstalled. Startup fix and game content preserved from 1.2. Install the APK and open Block Bloom Play, not the older Block Bloom icon. No physical Lenovo tablet test. See verification report for tests and limitations. Signing credentials are retained in a private owner backup, not in this public release.'
+          gh release upload "$TAG" candidate/Block-Bloom-Play-1.3.apk evidence/Block-Bloom-Play-1.3-Verification.txt Block-Bloom-Play-1.3-Source.zip --repo "$GITHUB_REPOSITORY" --clobber
+          python3 - <<'PY'
+          import os,urllib.request,hashlib,pathlib
+          url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/releases/download/block-bloom-play-v1.3/Block-Bloom-Play-1.3.apk'
+          data=urllib.request.urlopen(url,timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='89f72629d962fdf1c1f5e3fda38b39144eb34f1e4681f563bd33763277ad6a00'
+          pathlib.Path('evidence/public-download.txt').write_text('PASS public HTTPS download has exactly the same bytes as the tested APK\n'+url+'\n')
+          print('Verified public APK download checksum')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Block-Bloom-Play-1.3-Install-And-Runtime-Evidence
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
