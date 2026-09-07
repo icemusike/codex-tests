@@ -1,0 +1,28 @@
+name: Luna-compatible SDK 35 tools
+on:
+  push:
+    branches: [block-bloom-luna-method]
+    paths: ['.github/workflows/bloom-luna-sdk35.yml']
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Retrieve exact SDK generation used by the working Luna build
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          mkdir -p sdk35/lib sdk35/lib64
+          B="$ANDROID_HOME/build-tools/35.0.0"
+          cp "$B/aapt" "$B/zipalign" "$B/dexdump" sdk35/
+          cp "$B/lib/apksigner.jar" "$B/lib/d8.jar" sdk35/lib/
+          cp "$B/lib64/libc++.so" sdk35/lib64/
+          cp "$ANDROID_HOME/platforms/android-35/android.jar" sdk35/
+          cp "$B/core-lambda-stubs.jar" sdk35/
+          sha256sum sdk35/android.jar sdk35/aapt sdk35/zipalign > sdk35/checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Luna-SDK35
+          path: sdk35/
+          retention-days: 3
