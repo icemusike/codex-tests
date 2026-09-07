@@ -1,0 +1,95 @@
+name: Block Bloom Android 16 final verification
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths:
+      - 'block-bloom-transfer/**'
+      - '.github/workflows/block-bloom-final.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble exact locally-built test bundle
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,pathlib
+          p=pathlib.Path('block-bloom-transfer'); m=json.loads((p/'manifest.json').read_text())
+          data=base64.b64decode(''.join((p/n).read_text() for n in m['parts']))
+          assert hashlib.sha256(data).hexdigest()==m['sha256']
+          pathlib.Path(m['filename']).write_bytes(data)
+          PY
+          unzip -q Block-Bloom-Android16-Test-Bundle.zip -d block-bloom-test
+          sha256sum block-bloom-test/Block-Bloom-1.1-Android16.apk
+      - name: Install Android 16 emulator and API 36 tools
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platform-tools' 'emulator' 'platforms;android-36' 'build-tools;36.0.0' \
+            'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f \
+            -n bloom16 -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+      - name: Boot Android 16 tablet emulator
+        run: |
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloom16 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect > emulator.log 2>&1 &
+          adb wait-for-device
+          timeout 240 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell input keyevent 82 || true
+          adb shell wm size
+          adb shell getprop ro.build.version.release
+          adb shell getprop ro.build.version.sdk
+      - name: Verify clean install and execute first-pass gameplay tests
+        run: |
+          set -euo pipefail
+          GAME=block-bloom-test/Block-Bloom-1.1-Android16.apk
+          TEST=block-bloom-test/Block-Bloom-Android16-Tests.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$GAME"
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 "$GAME"
+          adb uninstall com.adrianisfan.blockbloom.android16 >/dev/null 2>&1 || true
+          adb install "$GAME" | tee install-clean.txt
+          grep -qx 'Success' install-clean.txt
+          adb install "$TEST" >/dev/null
+          adb shell am instrument -w -r -e phase first com.adrianisfan.blockbloom.test/.SmokeInstrumentation | tee test-first.txt
+          grep -q 'BLOCK_BLOOM_ANDROID16_TESTS_PASSED' test-first.txt
+      - name: Verify saved state after force-stop and process restart
+        run: |
+          adb shell am force-stop com.adrianisfan.blockbloom.android16
+          adb shell am kill com.adrianisfan.blockbloom.android16 || true
+          adb shell am instrument -w -r -e phase resume com.adrianisfan.blockbloom.test/.SmokeInstrumentation | tee test-resume.txt
+          grep -q 'BLOCK_BLOOM_ANDROID16_TESTS_PASSED' test-resume.txt
+      - name: Verify reinstall/update and installation metadata
+        run: |
+          adb install -r block-bloom-test/Block-Bloom-1.1-Android16.apk | tee install-update.txt
+          grep -qx 'Success' install-update.txt
+          adb shell dumpsys package com.adrianisfan.blockbloom.android16 > package.txt
+          grep -E 'versionName=|versionCode=|targetSdk=|minSdk=' package.txt | head -10
+          adb logcat -d -v brief | grep -E 'BlockBloom|BloomTest|FATAL EXCEPTION' > relevant-logcat.txt || true
+          ! grep -q 'FATAL EXCEPTION.*blockbloom' relevant-logcat.txt
+      - name: Publish verified Android 16 APK as a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG='block-bloom-android16-v1.1'
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --target "$GITHUB_SHA" --title 'Block Bloom 1.1 – Android 16 verified' \
+            --notes 'Rebuilt for Android 16 (API 36), 16 KB page-size aligned, signed with APK Signature Scheme v2/v3, and runtime-tested on a clean Android 16 Pixel Tablet emulator. Automated tests cover launch/rendering, touch navigation, line clear/scoring, Undo, Pause/Resume, all 24 Adventure levels, persistent local saves after force-stop/restart, and reinstall/update. Offline game: no ads, accounts, analytics, purchases, or Android network permission.'
+          gh release upload "$TAG" block-bloom-test/Block-Bloom-1.1-Android16.apk --clobber
+      - name: Retain verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Android16-Verification
+          path: |
+            install-clean.txt
+            install-update.txt
+            test-first.txt
+            test-resume.txt
+            package.txt
+            relevant-logcat.txt
+            emulator.log
+          retention-days: 14
