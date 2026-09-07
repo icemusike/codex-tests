@@ -1,0 +1,32 @@
+name: Recover tested Block Bloom source
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-recover-v12-source.yml']
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch the exact previously tested source archive
+        run: |
+          mkdir -p recovered
+          python3 - <<'PY'
+          import urllib.request,hashlib,json,pathlib
+          root='https://api.firestorage.ai/dev/file/shares/Os5nfj-ErtSa'
+          listing=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))
+          f=next(x for x in listing['files'] if x.get('fileName',x.get('name',''))=='Block-Bloom-1.2-Test-Package-R2.zip') if len(listing['files'])!=1 else listing['files'][0]
+          m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST'),timeout=40))
+          data=urllib.request.urlopen(m['downloadUrl'],timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='1edc11083686533f23cbdd1277af1a02019c655619284a257d715573e33369e5'
+          pathlib.Path('recovered/Block-Bloom-1.2-Source-And-Tests.zip').write_bytes(data)
+          print('Exact source bundle recovered:',len(data),'bytes')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Block-Bloom-Tested-Source-Recovery
+          path: recovered/
+          retention-days: 7
+          if-no-files-found: error
