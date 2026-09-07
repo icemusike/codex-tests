@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="ro.blockbloom.lunaplus.test" android:versionCode="200" android:versionName="2.0-tests">
+  <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"/>
+  <application android:label="Block Bloom automated tests"/>
+  <instrumentation android:name=".UpdateTests" android:targetPackage="ro.blockbloom.lunaplus" android:functionalTest="true"/>
+</manifest>

@@ -1,0 +1,66 @@
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+from http.server import ThreadingHTTPServer,SimpleHTTPRequestHandler
+import threading,os,json
+R=Path('/mnt/data/bloom-update');os.chdir(R)
+class Quiet(SimpleHTTPRequestHandler):
+ def log_message(self,*args):pass
+srv=ThreadingHTTPServer(('127.0.0.1',8873),Quiet)
+threading.Thread(target=srv.serve_forever,daemon=True).start()
+checks=[]
+def ok(x,name):
+ assert x,name
+ checks.append(name);print('PASS',name)
+with sync_playwright() as p:
+ browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox'])
+ page=browser.new_page(viewport={'width':800,'height':1280},device_scale_factor=1)
+ errors=[];page.on('pageerror',lambda e: errors.append(str(e)))
+ page.evaluate("Object.defineProperty(window,'localStorage',{value:{data:{},getItem(k){return this.data[k]||null},setItem(k,v){this.data[k]=String(v)},removeItem(k){delete this.data[k]}}})")
+ page.set_content((R/'index.html').read_text());page.wait_for_timeout(800)
+ ok(page.evaluate('window.BLOOM_VERSION')=='2.0','UI initializes 2.0')
+ ok(page.evaluate('BloomEngine.SHAPES.length')==48,'48 unique shape designs')
+ page.screenshot(path=str(R/'home.png'))
+ # A fixture is loaded through the same serialized-state entry point used on launch.
+ page.evaluate("localStorage.setItem('bloom.game',JSON.stringify(Object.assign(BloomEngine.newGame('cozy',1,42),{score:50000})))")
+ page.set_content((R/'index.html').read_text());page.wait_for_timeout(200)
+ ok(page.locator('#home-best').inner_text().endswith('50,000'),'50,000-point saved-game record is reconciled on startup')
+ page.locator('#home-settings').click();page.locator('[data-action=progress]').click()
+ page.locator('summary').click();page.locator('#restore-score').fill('51000');page.locator('[data-action=restoreScore]').click()
+ ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.profile')).bests.cozy")==51000,'manual previous-score recovery persists')
+ page.set_content((R/'index.html').read_text());page.locator('#collection').click()
+ ok('51,000' in page.locator('#modal').inner_text(),'best survives reload and is displayed in trophy garden')
+ page.locator('[data-action=close]').click();page.locator('#play-cozy').click()
+ if page.locator('[data-action=confirmStart]').count():page.locator('[data-action=confirmStart]').click()
+ if page.locator('[data-action=helpDone]').count():page.locator('[data-action=helpDone]').click()
+ ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.profile')).bests.cozy")==51000,'new lower-score run does not erase best')
+ page.locator('#pause').click();page.locator('[data-action=home]').click()
+ page.locator('#play-adventure').click()
+ print('level labels:',page.locator('.level-target').all_inner_texts())
+ ok(page.locator('.level-target').all_inner_texts()[:4]==['3 LINES','4 LINES','5 LINES','6 LINES'],'first four Adventure missions have increasing targets')
+ page.locator('[data-level="1"]').click()
+ ok('Clear 3 lines' in page.locator('#modal').inner_text(),'Adventure mission briefing shows actual target')
+ page.locator('[data-action=beginLevel]').click()
+ if page.locator('[data-action=confirmStart]').count():page.locator('[data-action=confirmStart]').click()
+ ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.game')).mode")=='adventure','Adventure starts from mission briefing')
+ page.locator('#pause').click();page.locator('[data-action=home]').click();page.locator('#play-prism').click();page.locator('[data-action=beginPrism]').click()
+ if page.locator('[data-action=confirmStart]').count():page.locator('[data-action=confirmStart]').click()
+ ok(page.locator('#rotate').is_visible(),'Prism exposes rotate control')
+ ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.game')).moveLimit")==40,'Prism enforces 40-move round')
+ page.screenshot(path=str(R/'prism.png'))
+ page.locator('#pause').click();page.locator('[data-action=settings]').click()
+ for name in ['neon','ocean','sunset','berry','pastel']:
+  page.locator('[data-palette="'+name+'"]').click()
+  ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.settings')).palette")==name,'palette '+name+' saved')
+ page.locator('[data-palette=neon]').click();page.screenshot(path=str(R/'palettes.png'))
+ page.locator('[data-action=gallery]').click();ok(page.locator('.shape-gallery svg').count()==48,'interactive gallery displays all 48 shapes')
+ page.locator('[data-action=backSettings]').click();page.locator('[data-action=progress]').click();page.locator('[data-action=export]').click();code=page.locator('#backup-code').input_value()
+ ok(code.startswith('BB2:'),'progress backup exported')
+ page.locator('[data-action=progress]').click();page.locator('[data-action=import]').click();page.locator('#import-code').fill(code);page.locator('[data-action=importDo]').click()
+ ok(page.locator('#home').is_visible(),'valid backup restores and returns home')
+ page.set_content((R/'index.html').read_text());ok(page.evaluate("JSON.parse(localStorage.getItem('bloom.settings')).palette")=='neon','palette selection survives a new session')
+ page.locator('#home-settings').click();page.locator('[data-action=lang-ro]').click()
+ ok('Culorile pieselor' in page.locator('#modal').inner_text(),'new settings localized in Romanian')
+ page.locator('[data-action=settingsDone]').click();page.set_viewport_size({'width':1280,'height':800});page.locator('#continue').click();page.wait_for_timeout(300);page.screenshot(path=str(R/'landscape.png'))
+ ok(not errors,'no browser JavaScript errors: '+str(errors))
+ browser.close()
+srv.shutdown();(R/'browser-tests.json').write_text(json.dumps(checks,indent=2))
