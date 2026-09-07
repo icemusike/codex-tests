@@ -1,0 +1,79 @@
+name: Block Bloom Play published APK visual check
+on:
+  push:
+    branches: [block-bloom-android16-fix]
+    paths: ['.github/workflows/block-bloom-play-visual-check.yml']
+permissions:
+  contents: read
+jobs:
+  visual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download published APK and prepare screen verification
+        run: |
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          mkdir -p evidence
+          python3 -m pip install --quiet pillow
+          python3 - <<'PY'
+          import urllib.request,pathlib,hashlib
+          url='https://github.com/icemusike/codex-tests/releases/download/block-bloom-play-v1.3/Block-Bloom-Play-1.3.apk'
+          data=urllib.request.urlopen(url,timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='89f72629d962fdf1c1f5e3fda38b39144eb34f1e4681f563bd33763277ad6a00'
+          pathlib.Path('game.apk').write_bytes(data)
+          PY
+      - name: Boot Android 16 with the display kept awake
+        run: |
+          sudo chmod 666 /dev/kvm
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomvisual -p "$ANDROID_AVD_HOME/bloomvisual.avd" -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-36\n' "$ANDROID_AVD_HOME/bloomvisual.avd" > "$ANDROID_AVD_HOME/bloomvisual.ini"
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloomvisual -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
+          timeout 120 adb wait-for-device
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell svc power stayon true
+          adb shell settings put system screen_off_timeout 1800000
+          adb shell input keyevent 224
+          adb shell input keyevent 82
+          adb shell wm density 160
+          adb install game.apk | tee evidence/install.txt
+          grep -q '^Success' evidence/install.txt
+      - name: Verify actual displayed portrait and landscape frames
+        run: |
+          python3 - <<'PY'
+          import subprocess,time,pathlib
+          from PIL import Image
+          def adb(*a):return subprocess.check_output(['adb',*a])
+          for mode,size in [('portrait','800x1280'),('landscape','1280x800')]:
+              adb('shell','am','force-stop','com.adrianisfan.blockbloom.play')
+              adb('shell','wm','size',size)
+              adb('shell','input','keyevent','224')
+              adb('shell','input','keyevent','82')
+              time.sleep(3)
+              adb('logcat','-c')
+              adb('shell','am','start','-W','-n','com.adrianisfan.blockbloom.play/.MainActivity')
+              path=pathlib.Path('evidence',mode+'.png')
+              for attempt in range(12):
+                  time.sleep(4)
+                  path.write_bytes(adb('exec-out','screencap','-p'))
+                  im=Image.open(path).convert('RGB');w,h=im.size
+                  shades=len({im.getpixel((10,y)) for y in range(50,h-90,7)})
+                  if shades>20:break
+              pathlib.Path('evidence',mode+'-logcat.txt').write_bytes(adb('logcat','-d'))
+              assert shades>20,(mode,'game background is not visibly rendered',shades)
+              assert adb('shell','pidof','com.adrianisfan.blockbloom.play').strip()
+              with pathlib.Path('evidence/visual-result.txt').open('a') as f:f.write('PASS '+mode+' displayed game canvas; '+str(shades)+' sampled background colors\n')
+          pathlib.Path('evidence/crash.txt').write_bytes(adb('logcat','-d','-b','crash'))
+          assert 'Process: com.adrianisfan.blockbloom.play' not in pathlib.Path('evidence/crash.txt').read_text()
+          print(pathlib.Path('evidence/visual-result.txt').read_text())
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Block-Bloom-Play-1.3-Awake-Display-Check
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
