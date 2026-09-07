@@ -1,0 +1,119 @@
+name: Block Bloom Luna Plus 2.0 verification
+on:
+  push:
+    branches: [block-bloom-luna-method]
+    paths: ['.github/workflows/block-bloom-luna-plus-v20.yml']
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Retrieve exact locally signed candidate without signing keys
+        run: |
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          mkdir -p evidence
+          python3 - <<'PY'
+          import urllib.request,json,pathlib,zipfile,hashlib
+          root='https://api.firestorage.ai/dev/file/shares/jG3WuPe06-NB'
+          f=json.load(urllib.request.urlopen(root+'/files?maxResults=1000',timeout=40))['files'][0]
+          m=json.load(urllib.request.urlopen(urllib.request.Request(root+'/files/'+f['fileId']+'/download',method='POST'),timeout=40))
+          data=urllib.request.urlopen(m['downloadUrl'],timeout=60).read()
+          assert hashlib.sha256(data).hexdigest()=='c5eb05becaa93105fd0646377bb76741eefd7a565fd9ba410d6fa846c3209b16'
+          pathlib.Path('candidate.zip').write_bytes(data)
+          with zipfile.ZipFile('candidate.zip') as z:z.extractall('candidate')
+          for name,sha in json.loads(pathlib.Path('candidate/checksums.json').read_text()).items():
+              assert hashlib.sha256(pathlib.Path('candidate',name).read_bytes()).hexdigest()==sha
+          PY
+      - name: Boot Android 16 tablet for API 35 Luna build tests
+        run: |
+          sudo chmod 666 /dev/kvm
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platform-tools' 'emulator' 'build-tools;35.0.0' 'system-images;android-36;google_apis;x86_64' >/dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n bloomplus -p "$ANDROID_AVD_HOME/bloomplus.avd" -k 'system-images;android-36;google_apis;x86_64' --device 'pixel_tablet'
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-36\n' "$ANDROID_AVD_HOME/bloomplus.avd" > "$ANDROID_AVD_HOME/bloomplus.ini"
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bloomplus -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 > evidence/emulator.log 2>&1 &
+          timeout 120 adb wait-for-device || { cat evidence/emulator.log; exit 1; }
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell input keyevent 82
+          adb shell wm size 1280x800
+          adb shell wm density 160
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell getprop ro.build.version.sdk > evidence/android-api.txt
+      - name: Install alongside the confirmed working Luna-method application
+        run: |
+          set -euo pipefail
+          curl -fsSL 'https://github.com/icemusike/codex-tests/releases/download/block-bloom-luna-method-1/Block-Bloom-Luna-Method.apk' -o original-luna.apk
+          echo 'a5c56fce0608c3af62d2890797b70ced2c9f1e14c110d05ada7c15a2ad255cc5  original-luna.apk' | sha256sum -c -
+          adb install original-luna.apk | tee evidence/old-install.txt
+          APK=candidate/Block-Bloom-Luna-Plus-2.0.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" > evidence/signature.txt
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -v 4 "$APK" > evidence/alignment.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > evidence/manifest.txt
+          adb install "$APK" | tee evidence/new-install.txt
+          grep -q '^Success' evidence/new-install.txt
+          adb shell pm list packages | grep 'ro.blockbloom' > evidence/side-by-side.txt
+          adb logcat -c
+          adb shell am start -W -n ro.blockbloom.lunaplus/.MainActivity > evidence/cold-launch.txt
+          sleep 4
+          adb shell pidof ro.blockbloom.lunaplus
+          adb exec-out screencap -p > evidence/home.png
+      - name: Run live save, Adventure advancement, Prism rotation and palette tests
+        run: |
+          set -euo pipefail
+          adb install candidate/Block-Bloom-Luna-Plus-Tests.apk
+          adb shell am force-stop ro.blockbloom.lunaplus
+          adb shell am instrument -w -r -e phase first ro.blockbloom.lunaplus.test/.UpdateTests | tee evidence/test-first.txt
+          grep -q 'BLOCK_BLOOM_2_TESTS_PASSED' evidence/test-first.txt
+          adb shell am force-stop ro.blockbloom.lunaplus
+      - name: Reboot device and verify the 50000 point record without WebView storage
+        run: |
+          set -euo pipefail
+          adb reboot
+          sleep 3
+          timeout 120 adb wait-for-device
+          timeout 240 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell input keyevent 82
+          adb shell wm size 800x1280
+          sleep 4
+          adb shell am instrument -w -r -e phase restart ro.blockbloom.lunaplus.test/.UpdateTests | tee evidence/test-reboot.txt
+          grep -q 'BLOCK_BLOOM_2_TESTS_PASSED' evidence/test-reboot.txt
+      - name: Verify same-key reinstall retains best score and Adventure unlocks
+        run: |
+          set -euo pipefail
+          adb install -r candidate/Block-Bloom-Luna-Plus-2.0.apk | tee evidence/reinstall.txt
+          grep -q '^Success' evidence/reinstall.txt
+          adb shell am instrument -w -r -e phase reinstall ro.blockbloom.lunaplus.test/.UpdateTests | tee evidence/test-reinstall.txt
+          grep -q 'BLOCK_BLOOM_2_TESTS_PASSED' evidence/test-reinstall.txt
+          adb shell am start -W -n ro.blockbloom.lunaplus/.MainActivity
+          sleep 4
+          adb exec-out screencap -p > evidence/portrait.png
+      - name: Collect actual runtime evidence
+        if: always()
+        run: |
+          adb logcat -d -b crash > evidence/crash.txt || true
+          adb logcat -d > evidence/logcat.txt || true
+          adb shell dumpsys package ro.blockbloom.lunaplus > evidence/package.txt || true
+          adb exec-out screencap -p > evidence/final.png || true
+          cp candidate/engine-tests.txt candidate/browser-tests.json evidence/ || true
+      - name: Publish the tested APK only after all checks passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ! grep -q 'Process: ro.blockbloom.lunaplus' evidence/crash.txt
+          cat evidence/test-first.txt evidence/test-reboot.txt evidence/test-reinstall.txt evidence/engine-tests.txt > Block-Bloom-Luna-Plus-2.0-Verification.txt
+          TAG='block-bloom-luna-plus-v2.0'
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title 'Block Bloom Luna+ 2.0 - records, Adventure and Prism' --notes 'Preserves the working Luna API-35 Activity + WebView packaging method. Adds synchronous app-private checkpoints for high scores, 24 progressively harder Adventure missions (3 to 26 lines with combo/color goals later), Prism 40-move mode with free rotation and score multipliers, 48 shapes, 5 block palettes, and progress export/import. Android 16 emulator checks cover touch gameplay, 50000-point score persistence after force-stop and full reboot with WebView storage cleared, Adventure advancement, Prism rotation, and same-key reinstall. Installs beside the older ro.blockbloom.game as Block Bloom Luna+. The old CI signing key was not retained; the new key is privately backed up for future updates. Use Settings > Scores & backup > Restore a previous best to recover your self-reported old record. No physical Lenovo test performed. No ads, network permission, analytics, or purchases.'
+          gh release upload "$TAG" candidate/Block-Bloom-Luna-Plus-2.0.apk Block-Bloom-Luna-Plus-2.0-Verification.txt --repo "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Block-Bloom-Luna-Plus-2.0-Verification
+          path: evidence/
+          retention-days: 30
